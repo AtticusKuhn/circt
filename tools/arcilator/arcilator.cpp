@@ -14,6 +14,7 @@
 #include "circt/Conversion/ArcToLLVM.h"
 #include "circt/Conversion/CombToArith.h"
 #include "circt/Conversion/ConvertToArcs.h"
+#include "circt/Conversion/Passes.h"
 #include "circt/Conversion/SeqToSV.h"
 #include "circt/Dialect/Arc/ArcDialect.h"
 #include "circt/Dialect/Arc/ArcInterfaces.h"
@@ -275,7 +276,7 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   if (untilReached(UntilArcConversion))
     return;
   {
-    ConvertToArcsOptions opts;
+    ConvertToArcsPassOptions opts;
     opts.tapRegisters = observeRegisters;
     pm.addPass(createConvertToArcsPass(opts));
   }
@@ -639,6 +640,8 @@ int main(int argc, char **argv) {
 
     // Dialect passes:
     arc::registerPasses();
+    registerConvertToArcsPass();
+    registerLowerArcToLLVMPass();
   }
 
   // Register any pass manager command line options.

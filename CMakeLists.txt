@@ -35,8 +35,13 @@ if( CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR )
 # Options and settings
 #-------------------------------------------------------------------------------
 
+  # MSVC-specific compiler configuration
   if (MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHs-c- /GR-")
+    # Enable UTF-8 support for source files and string literals.  This is
+    # required by dependencies like fmt library.
+    string(APPEND CMAKE_CXX_FLAGS " /utf-8")
+    string(APPEND CMAKE_C_FLAGS " /utf-8")
   else ()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions -fno-rtti")
   endif ()
@@ -564,8 +569,10 @@ if(CIRCT_SLANG_FRONTEND_ENABLED)
     FetchContent_Declare(
       slang
       GIT_REPOSITORY https://github.com/MikePopoloski/slang.git
-      GIT_TAG v9.0
-      GIT_SHALLOW ON)
+      GIT_TAG dd16a7947e0586d0541477f1b4b60eda7c986e35
+      # Shallow check-out doesn't work if the tag is ref spec is far from HEAD.
+      # GIT_SHALLOW ON
+    )
     set(FETCHCONTENT_TRY_FIND_PACKAGE_MODE "NEVER")
 
     # Force Slang to be built as a static library to avoid messing around with

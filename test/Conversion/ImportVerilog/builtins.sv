@@ -263,3 +263,26 @@ function void MathBuiltins(int x, logic [41:0] y, real r);
   // CHECK:  moore.builtin.atanh [[R]] : real
   dummyB($atanh(r));
 endfunction
+
+// CHECK-LABEL: func.func private @RandomBuiltins(
+// CHECK-SAME: [[X:%.+]]: !moore.i32
+function RandomBuiltins(int x);
+   // CHECK: [[RAND0:%.+]] = moore.builtin.urandom
+   // CHECK-NEXT: call @dummyA([[RAND0]]) : (!moore.i32) -> ()
+   dummyA($urandom());
+    // CHECK: [[RAND1:%.+]] = moore.builtin.urandom [[X]]
+    // CHECK-NEXT: call @dummyA([[RAND1]]) : (!moore.i32) -> ()
+   dummyA($urandom(x));
+endfunction
+
+// CHECK-LABEL: func.func private @TimeBuiltins(
+function TimeBuiltins();
+  // CHECK: [[TIME:%.+]] = moore.builtin.time
+  // CHECK-NEXT: [[TIMETOLOGIC:%.+]] = moore.time_to_logic [[TIME]]
+  dummyA($time());
+  // CHECK: [[STIME:%.+]] = moore.builtin.time
+  dummyA($stime());
+  // CHECK: [[REALTIME:%.+]] = moore.builtin.time
+  // TODO: There is no int-to-real conversion yet; change this to dummyB once int-to-real works!
+  dummyA($realtime());
+endfunction

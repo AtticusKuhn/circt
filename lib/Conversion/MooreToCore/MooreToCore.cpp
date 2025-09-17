@@ -1,12 +1,8 @@
-//===- MooreToCore.cpp - Moore To Core Conversion Pass --------------------===//
+//===----------------------------------------------------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-//===----------------------------------------------------------------------===//
-//
-// This is the main Moore to Core Conversion Pass Implementation.
 //
 //===----------------------------------------------------------------------===//
 
@@ -20,6 +16,7 @@
 #include "circt/Dialect/Moore/MooreOps.h"
 #include "circt/Dialect/Sim/SimOps.h"
 #include "circt/Dialect/Verif/VerifOps.h"
+#include "circt/Support/ConversionPatternSet.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -508,6 +505,26 @@ struct WaitEventOpConversion : public OpConversionPattern<WaitEventOp> {
   }
 };
 
+// moore.wait_delay -> llhd.wait
+static LogicalResult convert(WaitDelayOp op, WaitDelayOp::Adaptor adaptor,
+                             ConversionPatternRewriter &rewriter) {
+  auto *resumeBlock =
+      rewriter.splitBlock(op->getBlock(), ++Block::iterator(op));
+  rewriter.setInsertionPoint(op);
+  rewriter.replaceOpWithNewOp<llhd::WaitOp>(op, ValueRange{},
+                                            adaptor.getDelay(), ValueRange{},
+                                            ValueRange{}, resumeBlock);
+  rewriter.setInsertionPointToStart(resumeBlock);
+  return success();
+}
+
+// moore.unreachable -> llhd.halt
+static LogicalResult convert(UnreachableOp op, UnreachableOp::Adaptor adaptor,
+                             ConversionPatternRewriter &rewriter) {
+  rewriter.replaceOpWithNewOp<llhd::HaltOp>(op, ValueRange{});
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // Declaration Conversion
 //===----------------------------------------------------------------------===//
@@ -818,8 +835,10 @@ struct ExtractRefOpConversion : public OpConversionPattern<ExtractRefOp> {
           rewriter.getIntegerType(llvm::Log2_64_Ceil(arrType.getNumElements())),
           adaptor.getLowBit());
 
-      if (isa<hw::ArrayType>(
-              cast<hw::InOutType>(resultType).getElementType())) {
+      // If the result type is not the same as the array's element type, then
+      // it has to be a slice.
+      if (arrType.getElementType() !=
+          cast<hw::InOutType>(resultType).getElementType()) {
         rewriter.replaceOpWithNewOp<llhd::SigArraySliceOp>(
             op, resultType, adaptor.getInput(), lowBit);
         return success();
@@ -1151,6 +1170,24 @@ struct ConversionOpConversion : public OpConversionPattern<ConversionOp> {
     Value result =
         rewriter.createOrFold<hw::BitcastOp>(loc, resultType, amount);
     rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+template <typename SourceOp>
+struct BitcastConversion : public OpConversionPattern<SourceOp> {
+  using OpConversionPattern<SourceOp>::OpConversionPattern;
+  using OpAdaptor = typename SourceOp::Adaptor;
+  using ConversionPattern::typeConverter;
+
+  LogicalResult
+  matchAndRewrite(SourceOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto type = typeConverter->convertType(op.getResult().getType());
+    if (type == adaptor.getInput().getType())
+      rewriter.replaceOp(op, adaptor.getInput());
+    else
+      rewriter.replaceOpWithNewOp<hw::BitcastOp>(op, type, adaptor.getInput());
     return success();
   }
 };
@@ -1605,6 +1642,61 @@ struct DisplayBIOpConversion : public OpConversionPattern<DisplayBIOp> {
 } // namespace
 
 //===----------------------------------------------------------------------===//
+// Simulation Control Conversion
+//===----------------------------------------------------------------------===//
+
+// moore.builtin.stop -> sim.pause
+static LogicalResult convert(StopBIOp op, StopBIOp::Adaptor adaptor,
+                             ConversionPatternRewriter &rewriter) {
+  rewriter.replaceOpWithNewOp<sim::PauseOp>(op, /*verbose=*/false);
+  return success();
+}
+
+// moore.builtin.finish -> sim.terminate
+static LogicalResult convert(FinishBIOp op, FinishBIOp::Adaptor adaptor,
+                             ConversionPatternRewriter &rewriter) {
+  rewriter.replaceOpWithNewOp<sim::TerminateOp>(op, op.getExitCode() == 0,
+                                                /*verbose=*/false);
+  return success();
+}
+
+// moore.builtin.severity -> sim.proc.print
+static LogicalResult convert(SeverityBIOp op, SeverityBIOp::Adaptor adaptor,
+                             ConversionPatternRewriter &rewriter) {
+
+  std::string severityString;
+
+  switch (op.getSeverity()) {
+  case (Severity::Fatal):
+    severityString = "Fatal: ";
+    break;
+  case (Severity::Error):
+    severityString = "Error: ";
+    break;
+  case (Severity::Warning):
+    severityString = "Warning: ";
+    break;
+  default:
+    return failure();
+  }
+
+  auto prefix = rewriter.create<sim::FormatLitOp>(op.getLoc(), severityString);
+  auto message = rewriter.create<sim::FormatStringConcatOp>(
+      op.getLoc(), ValueRange{prefix, adaptor.getMessage()});
+  rewriter.replaceOpWithNewOp<sim::PrintFormattedProcOp>(op, message);
+  return success();
+}
+
+// moore.builtin.finish_message
+static LogicalResult convert(FinishMessageBIOp op,
+                             FinishMessageBIOp::Adaptor adaptor,
+                             ConversionPatternRewriter &rewriter) {
+  // We don't support printing termination/pause messages yet.
+  rewriter.eraseOp(op);
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // Conversion Infrastructure
 //===----------------------------------------------------------------------===//
 
@@ -1765,9 +1857,8 @@ static void populateTypeConversion(TypeConverter &typeConverter) {
       });
 }
 
-static void populateOpConversion(RewritePatternSet &patterns,
+static void populateOpConversion(ConversionPatternSet &patterns,
                                  TypeConverter &typeConverter) {
-  auto *context = patterns.getContext();
   // clang-format off
   patterns.add<
     // Patterns of declaration operations.
@@ -1776,22 +1867,41 @@ static void populateOpConversion(RewritePatternSet &patterns,
 
     // Patterns for conversion operations.
     ConversionOpConversion,
+    BitcastConversion<PackedToSBVOp>,
+    BitcastConversion<SBVToPackedOp>,
+    BitcastConversion<LogicToIntOp>,
+    BitcastConversion<IntToLogicOp>,
+    BitcastConversion<ToBuiltinBoolOp>,
     TruncOpConversion,
     ZExtOpConversion,
     SExtOpConversion,
 
     // Patterns of miscellaneous operations.
-    ConstantOpConv, ConcatOpConversion, ReplicateOpConversion,
+    ConstantOpConv,
+    ConcatOpConversion,
+    ReplicateOpConversion,
     ConstantTimeOpConv,
-    ExtractOpConversion, DynExtractOpConversion, DynExtractRefOpConversion,
+    ExtractOpConversion,
+    DynExtractOpConversion,
+    DynExtractRefOpConversion,
     ReadOpConversion,
-    StructExtractOpConversion, StructExtractRefOpConversion,
-    ExtractRefOpConversion, StructCreateOpConversion, ConditionalOpConversion, ArrayCreateOpConversion,
-    YieldOpConversion, OutputOpConversion, StringConstantOpConv,
+    StructExtractOpConversion,
+    StructExtractRefOpConversion,
+    ExtractRefOpConversion,
+    StructCreateOpConversion,
+    ConditionalOpConversion,
+    ArrayCreateOpConversion,
+    YieldOpConversion,
+    OutputOpConversion,
+    StringConstantOpConv,
 
     // Patterns of unary operations.
-    ReduceAndOpConversion, ReduceOrOpConversion, ReduceXorOpConversion,
-    BoolCastOpConversion, NotOpConversion, NegOpConversion,
+    ReduceAndOpConversion,
+    ReduceOrOpConversion,
+    ReduceXorOpConversion,
+    BoolCastOpConversion,
+    NotOpConversion,
+    NegOpConversion,
 
     // Patterns of binary operations.
     BinaryOpConversion<AddOp, comb::AddOp>,
@@ -1827,10 +1937,15 @@ static void populateOpConversion(RewritePatternSet &patterns,
     CaseXZEqOpConversion<CaseXZEqOp, false>,
 
     // Patterns of structural operations.
-    SVModuleOpConversion, InstanceOpConversion, ProcedureOpConversion, WaitEventOpConversion,
+    SVModuleOpConversion,
+    InstanceOpConversion,
+    ProcedureOpConversion,
+    WaitEventOpConversion,
 
     // Patterns of shifting operations.
-    ShrOpConversion, ShlOpConversion, AShrOpConversion,
+    ShrOpConversion,
+    ShlOpConversion,
+    AShrOpConversion,
 
     // Patterns of assignment operations.
     AssignOpConversion<ContinuousAssignOp, 0, 1>,
@@ -1839,11 +1954,14 @@ static void populateOpConversion(RewritePatternSet &patterns,
     AssignedVariableOpConversion,
 
     // Patterns of branch operations.
-    CondBranchOpConversion, BranchOpConversion,
+    CondBranchOpConversion,
+    BranchOpConversion,
 
     // Patterns of other operations outside Moore dialect.
-    HWInstanceOpConversion, ReturnOpConversion,
-    CallOpConversion, UnrealizedConversionCastConversion,
+    HWInstanceOpConversion,
+    ReturnOpConversion,
+    CallOpConversion,
+    UnrealizedConversionCastConversion,
     InPlaceOpConversion<debug::ArrayOp>,
     InPlaceOpConversion<debug::StructOp>,
     InPlaceOpConversion<debug::VariableOp>,
@@ -1858,8 +1976,18 @@ static void populateOpConversion(RewritePatternSet &patterns,
     FormatConcatOpConversion,
     FormatIntOpConversion,
     DisplayBIOpConversion
-  >(typeConverter, context);
+  >(typeConverter, patterns.getContext());
   // clang-format on
+
+  // Structural operations
+  patterns.add<WaitDelayOp>(convert);
+  patterns.add<UnreachableOp>(convert);
+
+  // Simulation control
+  patterns.add<StopBIOp>(convert);
+  patterns.add<SeverityBIOp>(convert);
+  patterns.add<FinishBIOp>(convert);
+  patterns.add<FinishMessageBIOp>(convert);
 
   mlir::populateAnyFunctionOpInterfaceTypeConversionPattern(patterns,
                                                             typeConverter);
@@ -1893,11 +2021,13 @@ void MooreToCorePass::runOnOperation() {
   IRRewriter rewriter(module);
   (void)mlir::eraseUnreachableBlocks(rewriter, module->getRegions());
 
-  ConversionTarget target(context);
   TypeConverter typeConverter;
-  RewritePatternSet patterns(&context);
   populateTypeConversion(typeConverter);
+
+  ConversionTarget target(context);
   populateLegality(target, typeConverter);
+
+  ConversionPatternSet patterns(&context, typeConverter);
   populateOpConversion(patterns, typeConverter);
 
   if (failed(applyFullConversion(module, target, std::move(patterns))))
